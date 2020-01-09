@@ -33,7 +33,7 @@ const (
 // ValidityEstimator estimates validity for request/response pairs
 type ValidityEstimator interface {
 	EstimateMaxAge(fullMethod string, req interface{}, resp interface{}) (int, error)
-	CreateUnaryInterceptor() func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error)
+	CreateUnaryInterceptor() grpc.UnaryServerInterceptor
 }
 
 // SimplisticValidityEstimator is rather simplistic in its operation
@@ -69,7 +69,7 @@ func (estimator *SimplisticValidityEstimator) EstimateMaxAge(fullMethod string, 
 }
 
 // CreateUnaryInterceptor Creates the gRPC Unary interceptor
-func (estimator *SimplisticValidityEstimator) CreateUnaryInterceptor() func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+func (estimator *SimplisticValidityEstimator) CreateUnaryInterceptor() grpc.UnaryServerInterceptor {
 	validityEstimationInterceptor := func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 		resp, err := handler(ctx, req)
 		if err != nil {
