@@ -82,6 +82,8 @@ func (estimator *SimplisticValidityEstimator) CreateUnaryInterceptor() grpc.Unar
 			grpc.SetHeader(ctx, metadata.Pairs("cache-control", fmt.Sprintf("must-revalidate, max-age=%d", maxAge)))
 		}
 
+		log.Printf("%s hit upstream and maxAge set to %d", info.FullMethod, maxAge)
+
 		return resp, err
 	}
 
