@@ -7,13 +7,10 @@ import (
 	"os"
 	"strconv"
 
+	interceptors "github.com/llarsson/grpc-caching-interceptors/server"
 	"go.opencensus.io/plugin/ocgrpc"
 	"go.opencensus.io/stats/view"
-	"golang.org/x/net/context"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/status"
 
 	pb "github.com/llarsson/grpc-caching-estimator/hipstershop"
 )
@@ -29,66 +26,6 @@ const (
 	paymentSerivceAddrKey        = "PAYMENT_SERVICE_ADDR"
 	emailServiceAddrKey          = "EMAIL_SERVICE_ADDR"
 )
-
-// ValidityEstimator estimates validity for request/response pairs
-type ValidityEstimator interface {
-	EstimateMaxAge(fullMethod string, req interface{}, resp interface{}) (int, error)
-	CreateUnaryInterceptor() grpc.UnaryServerInterceptor
-}
-
-// SimplisticValidityEstimator is rather simplistic in its operation
-type SimplisticValidityEstimator struct {
-}
-
-// EstimateMaxAge Estimates the max age of the specified request/response pair for the given method
-func (estimator *SimplisticValidityEstimator) EstimateMaxAge(fullMethod string, req interface{}, resp interface{}) (int, error) {
-	value, present := os.LookupEnv("PROXY_MAX_AGE")
-
-	if !present {
-		// It is not an error to not have the proxy max age key present in environment. We just act as if we were in passthrough mode.
-		return -1, nil
-	}
-
-	switch value {
-	case "dynamic":
-		{
-			return -1, status.Errorf(codes.Unimplemented, "Dynamic validity not implemented yet")
-		}
-	case "passthrough":
-		{
-			return -1, nil
-		}
-	default:
-		maxAge, err := strconv.Atoi(value)
-		if err != nil {
-			log.Printf("Failed to parse PROXY_MAX_AGE (%s) into integer", value)
-			return -1, err
-		}
-		return maxAge, nil
-	}
-}
-
-// CreateUnaryInterceptor Creates the gRPC Unary interceptor
-func (estimator *SimplisticValidityEstimator) CreateUnaryInterceptor() grpc.UnaryServerInterceptor {
-	validityEstimationInterceptor := func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-		resp, err := handler(ctx, req)
-		if err != nil {
-			log.Printf("Upstream call failed with error %v", err)
-			return resp, err
-		}
-
-		maxAge, err := estimator.EstimateMaxAge(info.FullMethod, req, resp)
-		if err == nil && maxAge > 0 {
-			grpc.SetHeader(ctx, metadata.Pairs("cache-control", fmt.Sprintf("must-revalidate, max-age=%d", maxAge)))
-		}
-
-		log.Printf("%s hit upstream and maxAge set to %d", info.FullMethod, maxAge)
-
-		return resp, err
-	}
-
-	return validityEstimationInterceptor
-}
 
 func main() {
 	port, err := strconv.Atoi(os.Getenv("PROXY_LISTEN_PORT"))
@@ -109,9 +46,9 @@ func main() {
 		log.Fatalf("Failed to register ocgrpc client views: %v", err)
 	}
 
-	estimator := new(SimplisticValidityEstimator)
+	estimator := new(interceptors.ConfigurableValidityEstimator)
 
-	grpcServer := grpc.NewServer(grpc.StatsHandler(&ocgrpc.ServerHandler{}), grpc.UnaryInterceptor(estimator.CreateUnaryInterceptor()))
+	grpcServer := grpc.NewServer(grpc.StatsHandler(&ocgrpc.ServerHandler{}), grpc.UnaryInterceptor(estimator.UnaryServerInterceptor()))
 
 	serviceAddrKeys := []string{productCatalogServiceAddrKey, currencyServiceAddrKey,
 		cartServiceAddrKey, recommendationServiceAddrKey, shippingServiceAddrKey,
