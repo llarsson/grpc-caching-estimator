@@ -3,7 +3,7 @@ FROM golang:latest AS build-env
 ENV CGO_ENABLED 0
 ADD . /go/src/github.com/llarsson/grpc-caching-estimator
 WORKDIR /go/src/github.com/llarsson/grpc-caching-estimator
-RUN go get ./... && go build -o /grpc-caching-estimator
+RUN go build -mod=vendor -o /grpc-caching-estimator
 # Multi-stage!
 FROM alpine
 WORKDIR /
