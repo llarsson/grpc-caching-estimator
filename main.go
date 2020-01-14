@@ -47,6 +47,7 @@ func main() {
 	}
 
 	estimator := new(interceptors.ConfigurableValidityEstimator)
+	estimator.Initialize()
 
 	grpcServer := grpc.NewServer(grpc.StatsHandler(&ocgrpc.ServerHandler{}), grpc.UnaryInterceptor(estimator.UnaryServerInterceptor()))
 
@@ -60,7 +61,7 @@ func main() {
 			continue
 		}
 
-		conn, err := grpc.Dial(upstreamAddr, grpc.WithInsecure(), grpc.WithStatsHandler(new(ocgrpc.ClientHandler)))
+		conn, err := grpc.Dial(upstreamAddr, grpc.WithInsecure(), grpc.WithStatsHandler(new(ocgrpc.ClientHandler)), grpc.WithUnaryInterceptor(estimator.UnaryClientInterceptor()))
 		if err != nil {
 			log.Fatalf("Cannot connect to upstream %s : %v", serviceAddrKey, err)
 		}

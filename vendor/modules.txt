@@ -6,8 +6,12 @@ github.com/golang/protobuf/ptypes
 github.com/golang/protobuf/ptypes/any
 github.com/golang/protobuf/ptypes/duration
 github.com/golang/protobuf/ptypes/timestamp
-# github.com/llarsson/grpc-caching-interceptors v0.0.0-20200110085858-0fdf7f498b7e
+# github.com/hashicorp/terraform v0.12.19
+github.com/hashicorp/terraform/helper/hashcode
+# github.com/llarsson/grpc-caching-interceptors v0.0.1 => ../grpc-caching-interceptors
 github.com/llarsson/grpc-caching-interceptors/server
+# github.com/patrickmn/go-cache v2.1.0+incompatible
+github.com/patrickmn/go-cache
 # go.opencensus.io v0.22.2
 go.opencensus.io
 go.opencensus.io/internal
@@ -24,7 +28,7 @@ go.opencensus.io/trace
 go.opencensus.io/trace/internal
 go.opencensus.io/trace/propagation
 go.opencensus.io/trace/tracestate
-# golang.org/x/net v0.0.0-20190620200207-3b0461eec859
+# golang.org/x/net v0.0.0-20191009170851-d66e71096ffb
 golang.org/x/net/context
 golang.org/x/net/http/httpguts
 golang.org/x/net/http2
@@ -32,7 +36,7 @@ golang.org/x/net/http2/hpack
 golang.org/x/net/idna
 golang.org/x/net/internal/timeseries
 golang.org/x/net/trace
-# golang.org/x/sys v0.0.0-20190502145724-3ef323f4f1fd
+# golang.org/x/sys v0.0.0-20190804053845-51ab0e2deafa
 golang.org/x/sys/unix
 # golang.org/x/text v0.3.2
 golang.org/x/text/secure/bidirule
