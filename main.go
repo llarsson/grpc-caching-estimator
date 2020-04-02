@@ -25,6 +25,8 @@ const (
 	adServiceAddrKey             = "AD_SERVICE_ADDR"
 	paymentSerivceAddrKey        = "PAYMENT_SERVICE_ADDR"
 	emailServiceAddrKey          = "EMAIL_SERVICE_ADDR"
+
+	csvFileName     = "data.csv"
 )
 
 func main() {
@@ -46,8 +48,14 @@ func main() {
 		log.Fatalf("Failed to register ocgrpc client views: %v", err)
 	}
 
+	csvFile, err := os.Create(csvFileName)
+	if err != nil {
+		log.Fatalf("Could not open CSV file (%s) for writing", csvFileName)
+	}
+	defer csvFile.Close()
+
 	estimator := new(interceptors.ConfigurableValidityEstimator)
-	estimator.Initialize()
+	estimator.Initialize(log.New(csvFile, "", 0))
 
 	grpcServer := grpc.NewServer(grpc.StatsHandler(&ocgrpc.ServerHandler{}), grpc.UnaryInterceptor(estimator.UnaryServerInterceptor()))
 
