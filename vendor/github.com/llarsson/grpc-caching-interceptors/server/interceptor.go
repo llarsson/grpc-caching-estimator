@@ -9,8 +9,11 @@ package server
 import (
 	"fmt"
 	"log"
+	"math"
 	"os"
+	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/golang/protobuf/proto"
@@ -18,124 +21,133 @@ import (
 	"github.com/patrickmn/go-cache"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/status"
 )
-
-const (
-	// MaximumCacheValidity is the highest number of seconds that an object
-	// can be considered valid.
-	MaximumCacheValidity = 300
-)
-
-// A ValidityEstimator hooks into the server side, and performs estimation of
-// how long responses may be stored in cache.
-type ValidityEstimator interface {
-	// EstimateMaxAge estimates how long a given request/response should be
-	// possible to cache (in seconds).
-	estimateMaxAge(fullMethod string, req interface{}, resp interface{}) (int, error)
-	// UnaryServerInterceptor returns the gRPC Interceptor for Unary operations
-	// that uses the EstimateMaxAge function on the request/response objects.
-	UnaryServerInterceptor() grpc.UnaryServerInterceptor
-	// UnaryClientInterceptor creates a gRPC Interceptor for outgoing calls,
-	// and is used for capturing information needed to make estimations
-	// more accurate by polling the origin server.
-	UnaryClientInterceptor() grpc.UnaryClientInterceptor
-}
-
-// ConfigurableValidityEstimator is a configurable ValidityEstimator.
-type ConfigurableValidityEstimator struct {
-	verifiers *cache.Cache
-	scheduler chan int
-}
 
 // Initialize new ConfigurableValidityEstimator.
-func (e *ConfigurableValidityEstimator) Initialize() {
-	e.verifiers = cache.New(time.Duration(MaximumCacheValidity)*time.Second, time.Duration(MaximumCacheValidity)*10*time.Second)
-	e.scheduler = make(chan int, 3)
+func (e *ConfigurableValidityEstimator) Initialize(csvLog *log.Logger) {
+	e.verifiers = cache.New(maxVerifierLifetime, time.Duration(maxVerifierLifetime)*2)
+	e.done = make(chan string, 1000)
+	e.csvLog = csvLog
+	e.csvLog.Printf("timestamp,source,method,estimate\n")
+
+	// clean up finished verifiers
 	go func() {
 		for {
-			delay, more := <-e.scheduler
-			if !more {
-				log.Printf("Closing down verification estimation")
-				return
-			}
-			time.Sleep(time.Duration(delay) * time.Second)
-			e.verifyEstimations()
+			finishedVerifier := <-e.done
+			log.Printf("Verifier %s finished (currently %d) in set", finishedVerifier, e.verifiers.ItemCount())
+			e.verifiers.Delete(finishedVerifier)
 		}
 	}()
-}
-
-// Stop the validation process. This can be done only once, as the
-// validation process will not continue.
-func (e *ConfigurableValidityEstimator) Stop() {
-	close(e.scheduler)
 }
 
 // estimateMaxAge estimates the cache validity of the specified
 // request/response pair for the given method. The result is given
 // in seconds.
-func (e *ConfigurableValidityEstimator) estimateMaxAge(fullMethod string, req interface{}, resp interface{}) (int, error) {
-	value, present := os.LookupEnv("PROXY_MAX_AGE")
+func (e *ConfigurableValidityEstimator) estimateMaxAge(fullMethod string, req interface{}, resp interface{}, responseTime time.Duration) (time.Duration, error) {
+	value, found := e.verifiers.Get(hash(fullMethod, req))
 
-	if !present {
-		// It is not an error to not have the proxy max age key present in environment. We just act as if we were in passthrough mode.
-		return -1, nil
-	}
-
-	switch value {
-	case "dynamic":
-		{
-			return -1, status.Errorf(codes.Unimplemented, "Dynamic validity not implemented yet")
-		}
-	case "passthrough":
-		{
-			return -1, nil
-		}
-	default:
-		maxAge, err := strconv.Atoi(value)
+	if found {
+		verifier := value.(*verifier)
+		err := verifier.update(resp.(proto.Message), responseTime)
 		if err != nil {
-			log.Printf("Failed to parse PROXY_MAX_AGE (%s) into integer", value)
+			log.Printf("Unable to update verifier %s", verifier.string())
 			return -1, err
 		}
+
+		maxAge, err := verifier.estimate()
+		if err != nil {
+			return -1, err
+		}
+
+		err = verifier.logEstimation(e.csvLog, "client")
+		if err != nil {
+			log.Printf("Failed to log CSV %v", err)
+		}
+
 		return maxAge, nil
 	}
+
+	// No estimation at this time is not an error. But that means that caching
+	// should not occur, either.
+	return 0, nil
 }
 
 // UnaryServerInterceptor creates the server-side gRPC Unary Interceptor
 // that is used to inject the cache-control header and the estimated
 // maximum age of the response object.
 func (e *ConfigurableValidityEstimator) UnaryServerInterceptor() grpc.UnaryServerInterceptor {
+
 	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+		startTime := time.Now()
 		resp, err := handler(ctx, req)
 		if err != nil {
 			log.Printf("Upstream call failed with error %v", err)
 			return resp, err
 		}
+		endTime := time.Now()
+		responseTime := endTime.Sub(startTime)
 
-		maxAge, err := e.estimateMaxAge(info.FullMethod, req, resp)
-		if err == nil && maxAge > 0 {
-			grpc.SetHeader(ctx, metadata.Pairs("cache-control", fmt.Sprintf("must-revalidate, max-age=%d", maxAge)))
+		// Only upstream call failures constitute true errors, so we only log others.
+		var maxAgeMessage string
+		if e.blacklisted(info.FullMethod) {
+			maxAgeMessage = fmt.Sprintf(", but method %s blacklisted from caching", info.FullMethod)
+		} else {
+			maxAge, err := e.estimateMaxAge(info.FullMethod, req, resp, responseTime)
+			if err == nil {
+				ttl := int(math.Round(maxAge.Seconds()))
+				grpc.SetHeader(ctx, metadata.Pairs("cache-control", fmt.Sprintf("must-revalidate, max-age=%d", ttl)))
+				maxAgeMessage = fmt.Sprintf(" and cache max-age set to %d", ttl)
+			} else {
+				maxAgeMessage = ", but an error occurred estimating max-age"
+			}
 		}
 
-		log.Printf("%s hit upstream and maxAge set to %d", info.FullMethod, maxAge)
-
-		return resp, err
+		log.Printf("%s(%s) hit upstream%s", info.FullMethod, req, maxAgeMessage)
+		return resp, nil
 	}
 }
 
-func (e *ConfigurableValidityEstimator) verificationNeeded(method string, req interface{}) bool {
-	return true
+func (e *ConfigurableValidityEstimator) blacklisted(method string) bool {
+	if blacklistExpression, found := os.LookupEnv("PROXY_CACHE_BLACKLIST"); found {
+		blacklisted, err := regexp.Match(blacklistExpression, []byte(method))
+		if err == nil && blacklisted {
+			return true
+		}
+	}
+	return false
 }
 
-type verifierMetadata struct {
-	method               string
-	req                  interface{}
-	target               string
-	previousReply        interface{}
-	verificationInterval time.Duration
-	verificationInstant  time.Time
+func (e *ConfigurableValidityEstimator) verificationNeeded(method string, req interface{}) (bool, time.Duration) {
+	// TODO Take into consideration, e.g., how often we have been asked to
+	// verify this one particular method and its request. Just to filter
+	// the verification process a bit, keeping the number of verifiers
+	// down.
+
+	if e.blacklisted(method) {
+		return false, -1
+	}
+
+	hash := hash(method, req)
+	_, expiration, found := e.verifiers.GetWithExpiration(hash)
+	if found {
+		if expiration.IsZero() || time.Now().Before(expiration) {
+			// Too spammy...
+			//log.Printf("%s(%s) needs no new verifier, object not expired yet (%s)", method, req, expiration)
+			return false, -1
+		}
+		log.Printf("%s(%s) verifier found, but expired. New verification needed.", method, req)
+		return true, maxVerifierLifetime
+	}
+	log.Printf("%s(%s) verifier not found, verification needed", method, req)
+	return true, maxVerifierLifetime
+}
+
+func hash(method string, req interface{}) string {
+	reqMessage := req.(proto.Message)
+	hash := hashcode.Strings([]string{method, reqMessage.String()})
+
+	return hash
 }
 
 // UnaryClientInterceptor catches outgoing calls and stores information
@@ -146,74 +158,99 @@ func (e *ConfigurableValidityEstimator) UnaryClientInterceptor() grpc.UnaryClien
 		// TODO(llarsson): store headers as well
 		err := invoker(ctx, method, req, reply, cc, opts...)
 		if err != nil {
+			log.Printf("Failure to invoke upstream %s(%s): %v", method, req, err)
 			return err
 		}
 
-		if e.verificationNeeded(method, req) {
-			reqMessage := req.(proto.Message)
-			hash := hashcode.Strings([]string{method, reqMessage.String()})
-			md := verifierMetadata{method: method, req: req, target: cc.Target(), previousReply: reply, verificationInterval: (5 * time.Second), verificationInstant: time.Now()}
-			err = e.verifiers.Add(hash, md, time.Duration(MaximumCacheValidity)*time.Second)
+		if needed, expiration := e.verificationNeeded(method, req); needed {
+			hash := hash(method, req)
+			now := time.Now()
+
+			strategy := initializeStrategy()
+			verifier, err := newVerifier(cc.Target(), method, req.(proto.Message), reply.(proto.Message), now.Add(expiration), strategy, e.csvLog, e.done)
 			if err != nil {
-				log.Printf("Failed to store verification metadata: %v", err)
+				log.Printf("Unable to create verifier for %s(%s): %v", method, req, err)
+				return err
 			}
 
-			log.Printf("Storing call to %s(%s) for estimation verification", method, reqMessage)
-			e.scheduler <- 5
+			// expiration is manually handled by our use of the "done" channel
+			err = e.verifiers.Add(hash, verifier, time.Duration(0))
+			if err != nil {
+				log.Printf("Failed to store verifier for %s: %v", verifier.string(), err)
+				return err
+			}
+
+			log.Printf("Stored %s for verification", verifier.string())
 		}
 
 		return nil
 	}
 }
 
-func (e *ConfigurableValidityEstimator) verifyEstimations() {
-	for key, value := range e.verifiers.Items() {
-		md := value.Object.(verifierMetadata)
+func initializeStrategy() estimationStrategy {
+	var strategy estimationStrategy
 
-		// No estimation needed yet for this object
-		if time.Now().Before(md.verificationInstant.Add(md.verificationInterval)) {
-			continue
-		}
-
-		opts := []grpc.DialOption{grpc.WithDefaultCallOptions(), grpc.WithInsecure()}
-		cc, err := grpc.Dial(md.target, opts...)
-		if err != nil {
-			log.Printf("Failed to dial %v", err)
-			continue
-		}
-		defer cc.Close()
-
-		requestMessage := md.req.(proto.Message)
-		previousReplyMessage := md.previousReply.(proto.Message)
-
-		reply := proto.Clone(previousReplyMessage)
-		err = cc.Invoke(context.Background(), md.method, md.req, reply)
-		if err != nil {
-			log.Printf("Failed to invoke call over established connection %v", err)
-			continue
-		}
-
-		verificationRequired, newInterval := verify(previousReplyMessage, reply, md.verificationInterval)
-		log.Printf("Verified %s(%s)", md.method, requestMessage.String())
-		if !verificationRequired {
-			e.verifiers.Delete(key)
-			continue
-		}
-
-		md.previousReply = reply
-		md.verificationInterval = newInterval
-		md.verificationInstant = time.Now()
-		remaining := time.Duration((value.Expiration - time.Now().UnixNano())) * time.Nanosecond
-		e.verifiers.Replace(key, md, remaining)
-		log.Printf("Object %s(%s) verified again in %s, stays in memory %s", md.method, requestMessage.String(), md.verificationInterval, remaining)
+	proxyMaxAge, found := os.LookupEnv("PROXY_MAX_AGE")
+	if !found {
+		log.Printf("PROXY_MAX_AGE not found, acting in passthrough mode")
+		return nil
 	}
 
-	// Run again in the near future.
-	e.scheduler <- 1
-}
+	if strings.HasPrefix(proxyMaxAge, "dynamic-") {
+		dynamicStrategySpecifiers := strings.Split(proxyMaxAge, "-")
+		strategyName := strings.Split(proxyMaxAge, "-")[1]
+		switch strategyName {
+		case "tbg1":
+			strategy = &dynamicTBG1Strategy{}
+		case "simplistic":
+			strategy = &simplisticStrategy{}
+		case "nyqvistish":
+			strategy = &nyqvistishStrategy{}
+		case "adaptive":
+			alphaStr := dynamicStrategySpecifiers[2]
+			alpha, err := strconv.ParseFloat(alphaStr, 64)
+			if err != nil {
+				log.Printf("Failed to parse alpha parameter for Adaptive strategy (%s), acting in passthrough mode", alphaStr)
+				return nil
+			}
 
-func verify(previousReply proto.Message, currentReply proto.Message, verificationInterval time.Duration) (bool, time.Duration) {
-	// TODO(llarsson): actual verification and smartness goes here :)
-	// TODO(llarsson): logic for determining if more verification is needed
-	return true, verificationInterval
+			strategy = &adaptiveStrategy{alpha: alpha}
+		case "updaterisk":
+			rhoStr := dynamicStrategySpecifiers[2]
+			rho, err := strconv.ParseFloat(rhoStr, 64)
+			if err != nil {
+				log.Printf("Failed to parse rho parameter for Update-risk Based strategy (%s), acting in passthrough mode", rhoStr)
+				return nil
+			}
+
+			strategy = &updateRiskBasedStrategy{rho: rho}
+		case "qualityelastic":
+			sloStr := dynamicStrategySpecifiers[2]
+			SLO, err := strconv.ParseFloat(sloStr, 64)
+			if err != nil {
+				log.Printf("Failed to parse SLO parameter for Quality-Elastic strategy (%s), acting in passthrough mode", sloStr)
+				return nil
+			}
+
+			strategy = &qualityElasticStrategy{SLO: time.Duration(SLO) * time.Millisecond}
+		default:
+			log.Printf("Unknown dynamic strategy (%s), using simplistic", strategyName)
+			strategy = &simplisticStrategy{}
+		}
+	} else if strings.HasPrefix(proxyMaxAge, "static-") {
+		ageSpecifier := strings.Split(proxyMaxAge, "-")[1]
+		maxAge, err := strconv.Atoi(ageSpecifier)
+		if err != nil {
+			log.Printf("Failed to parse PROXY_MAX_AGE (%s) into integer, acting in passthrough mode", ageSpecifier)
+			return nil
+		}
+		strategy = &staticStrategy{ttl: time.Duration(maxAge) * time.Second}
+	} else {
+		log.Printf("Unknown value for PROXY_MAX_AGE=%s, acting in passthrough mode", proxyMaxAge)
+		return nil
+	}
+
+	strategy.initialize()
+
+	return strategy
 }
