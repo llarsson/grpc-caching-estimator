@@ -10,8 +10,6 @@ github.com/golang/protobuf/ptypes/timestamp
 github.com/hashicorp/terraform/helper/hashcode
 # github.com/llarsson/grpc-caching-interceptors v0.0.1 => ../grpc-caching-interceptors
 github.com/llarsson/grpc-caching-interceptors/server
-# github.com/montanaflynn/stats v0.6.3
-github.com/montanaflynn/stats
 # github.com/patrickmn/go-cache v2.1.0+incompatible
 github.com/patrickmn/go-cache
 # go.opencensus.io v0.22.2
